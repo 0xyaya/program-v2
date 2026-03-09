@@ -5,9 +5,15 @@
  * One-time setup to create the fee config on-chain.
  * 
  * Usage:
- *   npx ts-node scripts/init-fee-config.ts --authority <PUBKEY> --recipient <PUBKEY>
+ *   npx ts-node scripts/init-fee-config.ts --program-id <PROGRAM_ID> --recipient <PUBKEY> [--authority <PUBKEY>] [--rpc <URL>]
  * 
- * If no args provided, uses payer pubkey for both authority and recipient.
+ * Required:
+ *   --program-id   Program ID
+ *   --recipient    Fee recipient pubkey
+ * 
+ * Optional:
+ *   --authority    Fee config authority (defaults to payer)
+ *   --rpc          RPC URL (defaults to devnet)
  */
 
 import {
@@ -21,40 +27,29 @@ import {
 import * as fs from 'fs';
 import * as path from 'path';
 
-const LAZORKIT_PROGRAM_ID = new PublicKey(
-  process.env.LAZORKIT_PROGRAM_ID || 'GkgBgRSHgBuMTUDhcVbnQGjBQyVyEaC8qDznzNNizfxk'
-);
-
-const RPC_URL = process.env.RPC_URL || 'https://api.devnet.solana.com';
-
-function deriveFeeConfigPda(): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from('fee_config')],
-    LAZORKIT_PROGRAM_ID
-  );
-}
-
-function loadPayer(): Keypair {
-  // Try PAYER_KEYPAIR as JSON object with base64 secretKey
-  if (process.env.PAYER_KEYPAIR) {
-    try {
-      const parsed = JSON.parse(process.env.PAYER_KEYPAIR);
-      if (parsed.secretKey) {
-        const secretKey = Buffer.from(parsed.secretKey, 'base64');
-        return Keypair.fromSecretKey(secretKey);
-      }
-    } catch {
-      // Not JSON, treat as path
-      if (fs.existsSync(process.env.PAYER_KEYPAIR)) {
-        const secretKey = JSON.parse(fs.readFileSync(process.env.PAYER_KEYPAIR, 'utf-8'));
-        return Keypair.fromSecretKey(Uint8Array.from(secretKey));
-      }
+function parseArgs(): { programId?: string; authority?: string; recipient?: string; rpc?: string } {
+  const args = process.argv.slice(2);
+  const result: { programId?: string; authority?: string; recipient?: string; rpc?: string } = {};
+  
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--program-id' && args[i + 1]) {
+      result.programId = args[++i];
+    } else if (args[i] === '--authority' && args[i + 1]) {
+      result.authority = args[++i];
+    } else if (args[i] === '--recipient' && args[i + 1]) {
+      result.recipient = args[++i];
+    } else if (args[i] === '--rpc' && args[i + 1]) {
+      result.rpc = args[++i];
     }
   }
   
-  // Try PAYER_SECRET_KEY as JSON array
-  if (process.env.PAYER_SECRET_KEY) {
-    const secretKey = JSON.parse(process.env.PAYER_SECRET_KEY);
+  return result;
+}
+
+function loadPayer(): Keypair {
+  // Try PAYER_KEYPAIR env var as path
+  if (process.env.PAYER_KEYPAIR && fs.existsSync(process.env.PAYER_KEYPAIR)) {
+    const secretKey = JSON.parse(fs.readFileSync(process.env.PAYER_KEYPAIR, 'utf-8'));
     return Keypair.fromSecretKey(Uint8Array.from(secretKey));
   }
   
@@ -65,37 +60,41 @@ function loadPayer(): Keypair {
     return Keypair.fromSecretKey(Uint8Array.from(secretKey));
   }
   
-  throw new Error('No payer keypair found. Set PAYER_KEYPAIR or PAYER_SECRET_KEY');
-}
-
-function parseArgs(): { authority?: string; recipient?: string } {
-  const args = process.argv.slice(2);
-  const result: { authority?: string; recipient?: string } = {};
-  
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--authority' && args[i + 1]) {
-      result.authority = args[++i];
-    } else if (args[i] === '--recipient' && args[i + 1]) {
-      result.recipient = args[++i];
-    }
-  }
-  
-  return result;
+  throw new Error('No payer keypair found. Set PAYER_KEYPAIR env var or have ~/.config/solana/id.json');
 }
 
 async function main() {
-  console.log('🚀 Initializing Fee Config PDA...\n');
-  
-  const connection = new Connection(RPC_URL, 'confirmed');
-  const payer = loadPayer();
   const args = parseArgs();
   
-  console.log('Program ID:', LAZORKIT_PROGRAM_ID.toBase58());
-  console.log('RPC URL:', RPC_URL);
+  if (!args.programId) {
+    console.error('Error: --program-id is required');
+    console.log('Usage: npx ts-node init-fee-config.ts --program-id <PROGRAM_ID> --recipient <PUBKEY>');
+    process.exit(1);
+  }
+  
+  if (!args.recipient) {
+    console.error('Error: --recipient is required');
+    console.log('Usage: npx ts-node init-fee-config.ts --program-id <PROGRAM_ID> --recipient <PUBKEY>');
+    process.exit(1);
+  }
+  
+  const programId = new PublicKey(args.programId);
+  const rpcUrl = args.rpc || 'https://api.devnet.solana.com';
+  
+  console.log('🚀 Initializing Fee Config PDA...\n');
+  
+  const connection = new Connection(rpcUrl, 'confirmed');
+  const payer = loadPayer();
+  
+  console.log('Program ID:', programId.toBase58());
+  console.log('RPC URL:', rpcUrl);
   console.log('Payer:', payer.publicKey.toBase58());
   
   // Derive fee config PDA
-  const [feeConfigPda, bump] = deriveFeeConfigPda();
+  const [feeConfigPda, bump] = PublicKey.findProgramAddressSync(
+    [Buffer.from('fee_config')],
+    programId
+  );
   console.log('Fee Config PDA:', feeConfigPda.toBase58());
   console.log('Bump:', bump);
   
@@ -120,9 +119,7 @@ async function main() {
     ? new PublicKey(args.authority)
     : payer.publicKey;
     
-  const recipient = args.recipient 
-    ? new PublicKey(args.recipient)
-    : payer.publicKey;
+  const recipient = new PublicKey(args.recipient);
   
   console.log('\nConfig to create:');
   console.log('  Authority:', authority.toBase58());
@@ -137,7 +134,7 @@ async function main() {
   recipient.toBuffer().copy(data, 33);
   
   const initIx = new TransactionInstruction({
-    programId: LAZORKIT_PROGRAM_ID,
+    programId,
     keys: [
       { pubkey: payer.publicKey, isSigner: true, isWritable: true },
       { pubkey: feeConfigPda, isSigner: false, isWritable: true },
