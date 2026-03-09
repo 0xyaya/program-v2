@@ -20,7 +20,6 @@ import {
 } from '@solana/web3.js';
 import * as fs from 'fs';
 import * as path from 'path';
-import 'dotenv/config';
 
 const LAZORKIT_PROGRAM_ID = new PublicKey(
   process.env.LAZORKIT_PROGRAM_ID || 'GkgBgRSHgBuMTUDhcVbnQGjBQyVyEaC8qDznzNNizfxk'
