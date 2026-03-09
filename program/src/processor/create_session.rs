@@ -17,35 +17,51 @@ use crate::{
     state::{authority::AuthorityAccountHeader, session::SessionAccount, AccountDiscriminator},
 };
 
-/// Arguments for the `CreateSession` instruction.
+/// Arguments for the `CreateSession` instruction (V3).
 ///
-/// Layout:
-/// - `session_key`: The public key of the ephemeral session signer.
-/// - `expires_at`: The absolute slot height when this session expires.
+/// Layout (80 bytes):
+/// - `session_key`: The public key of the ephemeral session signer (32).
+/// - `expires_at`: The absolute slot height when this session expires (8).
+/// - `mint`: Allowed token mint (all zeros = native SOL) (32).
+/// - `max_amount`: Maximum spendable amount (8).
 #[repr(C, align(8))]
 #[derive(NoPadding)]
 pub struct CreateSessionArgs {
     pub session_key: [u8; 32],
     pub expires_at: u64,
+    pub mint: [u8; 32],
+    pub max_amount: u64,
 }
 
 impl CreateSessionArgs {
+    /// Size of V3 CreateSessionArgs in bytes.
+    pub const SIZE: usize = 80;
+
     pub fn from_bytes(data: &[u8]) -> Result<Self, ProgramError> {
-        if data.len() < 40 {
+        if data.len() < Self::SIZE {
             return Err(ProgramError::InvalidInstructionData);
         }
-        // args are: [session_key(32)][expires_at(8)]
-        let (key_bytes, rest) = data.split_at(32);
-        let (alloc_bytes, _) = rest.split_at(8);
+        // args are: [session_key(32)][expires_at(8)][mint(32)][max_amount(8)]
+        let mut offset = 0;
 
         let mut session_key = [0u8; 32];
-        session_key.copy_from_slice(key_bytes);
+        session_key.copy_from_slice(&data[offset..offset + 32]);
+        offset += 32;
 
-        let expires_at = u64::from_le_bytes(alloc_bytes.try_into().unwrap());
+        let expires_at = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+
+        let mut mint = [0u8; 32];
+        mint.copy_from_slice(&data[offset..offset + 32]);
+        offset += 32;
+
+        let max_amount = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
 
         Ok(Self {
             session_key,
             expires_at,
+            mint,
+            max_amount,
         })
     }
 }
@@ -160,9 +176,13 @@ pub fn process(
     let data_payload = &instruction_data[..payload_offset];
 
     // Include payer in signed payload to prevent payer swap
-    let mut ed25519_payload = Vec::with_capacity(64);
+    // V3: Challenge includes session_key || expires_at || mint || max_amount
+    let mut ed25519_payload = Vec::with_capacity(112);
     ed25519_payload.extend_from_slice(payer.key().as_ref());
     ed25519_payload.extend_from_slice(&args.session_key);
+    ed25519_payload.extend_from_slice(&args.expires_at.to_le_bytes());
+    ed25519_payload.extend_from_slice(&args.mint);
+    ed25519_payload.extend_from_slice(&args.max_amount.to_le_bytes());
 
     match auth_header.authority_type {
         0 => {
@@ -218,16 +238,20 @@ pub fn process(
         &seeds,
     )?;
 
-    // Initialize Session State
+    // Initialize Session State (V3 with spending limits)
     let data = unsafe { session_pda.borrow_mut_data_unchecked() };
     let session = SessionAccount {
         discriminator: AccountDiscriminator::Session as u8,
         bump,
-        version: crate::state::CURRENT_ACCOUNT_VERSION,
-        _padding: [0; 5],
+        version: crate::state::session::CURRENT_SESSION_VERSION,
+        flags: 0,
+        _reserved: [0; 4],
         wallet: *wallet_pda.key(),
         session_key: Pubkey::from(args.session_key),
         expires_at: args.expires_at,
+        mint: Pubkey::from(args.mint),
+        max_amount: args.max_amount,
+        spent_amount: 0,
     };
 
     // Safe write
@@ -249,20 +273,32 @@ mod tests {
     #[test]
     fn test_create_session_args_from_bytes() {
         let mut data = Vec::new();
-        // session_key(32) + expires_at(8)
+        // V3: session_key(32) + expires_at(8) + mint(32) + max_amount(8)
         let session_key = [7u8; 32];
         let expires_at = 12345678u64;
+        let mint = [0u8; 32]; // Native SOL
+        let max_amount = 1_000_000_000u64; // 1 SOL
+
         data.extend_from_slice(&session_key);
         data.extend_from_slice(&expires_at.to_le_bytes());
+        data.extend_from_slice(&mint);
+        data.extend_from_slice(&max_amount.to_le_bytes());
 
         let args = CreateSessionArgs::from_bytes(&data).unwrap();
         assert_eq!(args.session_key, session_key);
         assert_eq!(args.expires_at, expires_at);
+        assert_eq!(args.mint, mint);
+        assert_eq!(args.max_amount, max_amount);
+    }
+
+    #[test]
+    fn test_create_session_args_size() {
+        assert_eq!(CreateSessionArgs::SIZE, 80);
     }
 
     #[test]
     fn test_create_session_args_too_short() {
-        let data = vec![0u8; 39]; // Need 40
+        let data = vec![0u8; 79]; // Need 80
         assert!(CreateSessionArgs::from_bytes(&data).is_err());
     }
 }

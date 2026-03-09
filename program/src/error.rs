@@ -16,6 +16,10 @@ pub enum AuthError {
     InvalidAuthenticationKind = 3011,
     InvalidMessage = 3012,
     SelfReentrancyNotAllowed = 3013,
+    /// Spending limit exceeded for this session.
+    SpendingLimitExceeded = 0x20,
+    /// Invalid or unsupported token mint.
+    InvalidMint = 0x21,
 }
 
 impl From<AuthError> for ProgramError {
