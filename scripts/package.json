@@ -1,0 +1,11 @@
+{
+  "name": "lazorkit-scripts",
+  "private": true,
+  "scripts": {
+    "init-fee-config": "tsx init-fee-config.ts"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.0",
+    "tsx": "^4.21.0"
+  }
+}
