@@ -34,12 +34,13 @@ use pinocchio::{
 /// 4. **Execution**: Invokes the Instructions via CPI, signing with the Vault PDA.
 ///
 /// # Accounts:
-/// 1. `[signer]` Payer.
-/// 2. `[]` Wallet PDA.
-/// 3. `[signer]` Authority or Session PDA.
-/// 4. `[signer]` Vault PDA (Signer for CPI).
-/// 5. `[]` FeeConfig PDA (read fee recipient from on-chain state).
-/// 6. `[writable]` Fee recipient (must match recipient stored in FeeConfig).
+/// 0. `[signer]` Payer.
+/// 1. `[]` Wallet PDA.
+/// 2. `[signer, writable]` Authority or Session PDA.
+/// 3. `[writable]` Vault PDA (Signer for CPI).
+/// 4. `[]` FeeConfig PDA (read fee recipient from on-chain state).
+/// 5. `[writable]` Fee recipient (must match recipient stored in FeeConfig).
+/// 6. `[]` System Program (for fee transfer CPI).
 /// 7. `...` Inner accounts referenced by instructions.
 pub fn process(
     program_id: &Pubkey,
@@ -66,9 +67,12 @@ pub fn process(
     let fee_recipient = account_info_iter
         .next()
         .ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let system_program = account_info_iter
+        .next()
+        .ok_or(ProgramError::NotEnoughAccountKeys)?;
 
-    // Remaining accounts are for inner instructions (after fee_config and fee_recipient)
-    let inner_accounts_start = 6;
+    // Remaining accounts are for inner instructions (after system_program)
+    let inner_accounts_start = 7;
     let _inner_accounts = &accounts[inner_accounts_start..];
 
     // Verify FeeConfig PDA ownership and read recipient
@@ -90,6 +94,11 @@ pub fn process(
     // Verify the provided fee_recipient account matches the stored recipient
     if fee_recipient.key() != &stored_recipient {
         return Err(ProgramError::InvalidAccountData);
+    }
+
+    // Verify System Program
+    if system_program.key() != &Pubkey::from(crate::utils::SYSTEM_PROGRAM_ID) {
+        return Err(ProgramError::IncorrectProgramId);
     }
 
     // Verify ownership
@@ -257,9 +266,11 @@ pub fn process(
 
     // Fee deduction: Transfer BASE_FEE_LAMPORTS from vault to fee_recipient
     // Fee recipient is read from FeeConfig PDA and verified above
-    if fee_recipient.is_writable() {
-        deduct_fee(vault_pda, fee_recipient, vault_bump, wallet_pda.key())?;
+    // Fee is MANDATORY - reject if fee_recipient not writable
+    if !fee_recipient.is_writable() {
+        return Err(ProgramError::InvalidAccountData);
     }
+    deduct_fee(vault_pda, fee_recipient, system_program, vault_bump, wallet_pda.key())?;
 
     // Execute each compact instruction
     for compact_ix in &compact_instructions {
@@ -406,16 +417,18 @@ fn compute_accounts_hash(
     Ok(hash)
 }
 
-/// Deduct fee from vault and transfer to fee recipient.
+/// Deduct fee from vault and transfer to fee recipient via CPI.
 ///
 /// # Arguments
-/// * `vault` - Vault PDA to deduct from
+/// * `vault` - Vault PDA to deduct from (owned by System Program)
 /// * `fee_recipient` - Account to receive the fee
+/// * `system_program` - System Program for CPI transfer
 /// * `vault_bump` - Bump seed for vault PDA signing
 /// * `wallet_key` - Wallet pubkey for vault seed derivation
 fn deduct_fee(
     vault: &AccountInfo,
     fee_recipient: &AccountInfo,
+    system_program: &AccountInfo,
     vault_bump: u8,
     wallet_key: &Pubkey,
 ) -> ProgramResult {
@@ -426,21 +439,49 @@ fn deduct_fee(
         return Ok(());
     }
 
-    // Transfer fee via direct lamports manipulation
-    // Note: This is safe because we own the vault PDA
-    unsafe {
-        // Deduct from vault
-        let vault_lamports = vault.borrow_mut_lamports_unchecked();
-        *vault_lamports = vault_lamports.saturating_sub(BASE_FEE_LAMPORTS);
-        
-        // Add to fee recipient
-        let recipient_lamports = fee_recipient.borrow_mut_lamports_unchecked();
-        *recipient_lamports = recipient_lamports.saturating_add(BASE_FEE_LAMPORTS);
-    }
+    // Build System Program transfer instruction
+    // Instruction data: [2, 0, 0, 0] (transfer = 2) + amount as u64 LE
+    let mut transfer_data = [0u8; 12];
+    transfer_data[0] = 2; // Transfer instruction index
+    transfer_data[4..12].copy_from_slice(&BASE_FEE_LAMPORTS.to_le_bytes());
 
-    // Suppress unused warnings
-    let _ = vault_bump;
-    let _ = wallet_key;
+    let transfer_accounts = [
+        AccountMeta {
+            pubkey: vault.key(),
+            is_signer: true,
+            is_writable: true,
+        },
+        AccountMeta {
+            pubkey: fee_recipient.key(),
+            is_signer: false,
+            is_writable: true,
+        },
+    ];
+
+    let transfer_ix = Instruction {
+        program_id: &Pubkey::from(crate::utils::SYSTEM_PROGRAM_ID),
+        accounts: &transfer_accounts,
+        data: &transfer_data,
+    };
+
+    // Create vault PDA signer seeds
+    let vault_bump_arr = [vault_bump];
+    let seeds = [
+        Seed::from(b"vault"),
+        Seed::from(wallet_key.as_ref()),
+        Seed::from(&vault_bump_arr),
+    ];
+    let signer: Signer = (&seeds).into();
+
+    // CPI to System Program with vault as signer
+    let cpi_accounts = [
+        Account::from(vault),
+        Account::from(fee_recipient),
+        Account::from(system_program),
+    ];
+    unsafe {
+        invoke_signed_unchecked(&transfer_ix, &cpi_accounts, &[signer]);
+    }
 
     Ok(())
 }
