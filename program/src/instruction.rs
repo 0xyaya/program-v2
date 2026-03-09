@@ -157,6 +157,28 @@ pub enum ProgramIx {
         session_key: [u8; 32],
         expires_at: i64,
     },
+
+    /// Initialize the fee configuration PDA
+    #[account(
+        0,
+        signer,
+        writable,
+        name = "payer",
+        desc = "Payer and rent contributor"
+    )]
+    #[account(1, writable, name = "fee_config", desc = "Fee config PDA")]
+    #[account(2, name = "system_program", desc = "System Program")]
+    InitFeeConfig {
+        authority: [u8; 32],
+        recipient: [u8; 32],
+    },
+
+    /// Update the fee recipient address
+    #[account(0, signer, name = "authority", desc = "Fee config authority")]
+    #[account(1, writable, name = "fee_config", desc = "Fee config PDA")]
+    UpdateFeeRecipient {
+        new_recipient: [u8; 32],
+    },
 }
 
 #[repr(C)]
@@ -240,6 +262,26 @@ pub enum LazorKitInstruction {
     CreateSession {
         session_key: [u8; 32],
         expires_at: u64,
+    },
+
+    /// Initialize the fee configuration PDA
+    ///
+    /// Accounts:
+    /// 1. `[signer, writable]` Payer
+    /// 2. `[writable]` Fee Config PDA
+    /// 3. `[]` System Program
+    InitFeeConfig {
+        authority: [u8; 32],
+        recipient: [u8; 32],
+    },
+
+    /// Update the fee recipient address
+    ///
+    /// Accounts:
+    /// 1. `[signer]` Authority
+    /// 2. `[writable]` Fee Config PDA
+    UpdateFeeRecipient {
+        new_recipient: [u8; 32],
     },
 }
 
@@ -329,6 +371,32 @@ impl LazorKitInstruction {
                 Ok(Self::CreateSession {
                     session_key: session_key.try_into().unwrap(),
                     expires_at,
+                })
+            },
+            6 => {
+                // InitFeeConfig
+                // Format: [authority(32)][recipient(32)]
+                if rest.len() < 32 + 32 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let (authority, rest) = rest.split_at(32);
+                let (recipient, _) = rest.split_at(32);
+
+                Ok(Self::InitFeeConfig {
+                    authority: authority.try_into().unwrap(),
+                    recipient: recipient.try_into().unwrap(),
+                })
+            },
+            7 => {
+                // UpdateFeeRecipient
+                // Format: [new_recipient(32)]
+                if rest.len() < 32 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let (new_recipient, _) = rest.split_at(32);
+
+                Ok(Self::UpdateFeeRecipient {
+                    new_recipient: new_recipient.try_into().unwrap(),
                 })
             },
             _ => Err(ProgramError::InvalidInstructionData),

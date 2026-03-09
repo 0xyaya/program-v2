@@ -4,7 +4,13 @@ use crate::{
     },
     compact::parse_compact_instructions,
     error::AuthError,
-    state::{authority::AuthorityAccountHeader, AccountDiscriminator},
+    state::{
+        authority::AuthorityAccountHeader,
+        fee::{FEE_CONFIG_DISCRIMINATOR, offsets},
+        session::SessionAccount,
+        AccountDiscriminator,
+    },
+    BASE_FEE_LAMPORTS,
 };
 use pinocchio::{
     account_info::AccountInfo,
@@ -32,7 +38,9 @@ use pinocchio::{
 /// 2. `[]` Wallet PDA.
 /// 3. `[signer]` Authority or Session PDA.
 /// 4. `[signer]` Vault PDA (Signer for CPI).
-/// 5. `...` Inner accounts referenced by instructions.
+/// 5. `[]` FeeConfig PDA (read fee recipient from on-chain state).
+/// 6. `[writable]` Fee recipient (must match recipient stored in FeeConfig).
+/// 7. `...` Inner accounts referenced by instructions.
 pub fn process(
     program_id: &Pubkey,
     accounts: &[AccountInfo],
@@ -52,10 +60,37 @@ pub fn process(
     let vault_pda = account_info_iter
         .next()
         .ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fee_config_pda = account_info_iter
+        .next()
+        .ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let fee_recipient = account_info_iter
+        .next()
+        .ok_or(ProgramError::NotEnoughAccountKeys)?;
 
-    // Remaining accounts are for inner instructions
-    let inner_accounts_start = 4;
+    // Remaining accounts are for inner instructions (after fee_config and fee_recipient)
+    let inner_accounts_start = 6;
     let _inner_accounts = &accounts[inner_accounts_start..];
+
+    // Verify FeeConfig PDA ownership and read recipient
+    if fee_config_pda.owner() != program_id {
+        return Err(ProgramError::IllegalOwner);
+    }
+    let fee_config_data = unsafe { fee_config_pda.borrow_data_unchecked() };
+    if fee_config_data.len() < offsets::RECIPIENT + 32 {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    if fee_config_data[offsets::DISCRIMINATOR] != FEE_CONFIG_DISCRIMINATOR {
+        return Err(ProgramError::InvalidAccountData);
+    }
+    // Read the fee recipient pubkey from FeeConfig (offset 33, 32 bytes)
+    let stored_recipient: Pubkey = fee_config_data[offsets::RECIPIENT..offsets::RECIPIENT + 32]
+        .try_into()
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    
+    // Verify the provided fee_recipient account matches the stored recipient
+    if fee_recipient.key() != &stored_recipient {
+        return Err(ProgramError::InvalidAccountData);
+    }
 
     // Verify ownership
     if wallet_pda.owner() != program_id || authority_pda.owner() != program_id {
@@ -82,6 +117,10 @@ pub fn process(
     } else {
         return Err(ProgramError::InvalidAccountData);
     };
+
+    // Track if this is session authentication for spending limit enforcement
+    let mut is_session_auth = false;
+    let mut session_mint: Option<Pubkey> = None;
 
     // Parse compact instructions
     let compact_instructions = parse_compact_instructions(instruction_data)?;
@@ -141,43 +180,8 @@ pub fn process(
             }
         },
         3 => {
-            // Session
-            let session_data = unsafe { authority_pda.borrow_mut_data_unchecked() };
-            if session_data.len() < std::mem::size_of::<crate::state::session::SessionAccount>() {
-                return Err(ProgramError::InvalidAccountData);
-            }
-
-            // Use read_unaligned to safely load SessionAccount
-            let session = unsafe {
-                std::ptr::read_unaligned(
-                    session_data.as_ptr() as *const crate::state::session::SessionAccount
-                )
-            };
-
-            let clock = Clock::get()?;
-            let current_slot = clock.slot;
-
-            // Verify Wallet
-            if session.wallet != *wallet_pda.key() {
-                return Err(ProgramError::InvalidAccountData);
-            }
-
-            // Verify Expiry
-            if current_slot > session.expires_at {
-                return Err(AuthError::SessionExpired.into());
-            }
-
-            // Verify Signer matches Session Key
-            let mut signer_matched = false;
-            for acc in accounts {
-                if acc.is_signer() && *acc.key() == session.session_key {
-                    signer_matched = true;
-                    break;
-                }
-            }
-            if !signer_matched {
-                return Err(ProgramError::MissingRequiredSignature);
-            }
+            // Session (V3 with spending limits)
+            is_session_auth = true;
         },
         _ => return Err(ProgramError::InvalidAccountData),
     }
@@ -190,6 +194,71 @@ pub fn process(
     // CRITICAL: Ensure we are signing with the correct Vault derived from this Wallet.
     if vault_pda.key() != &vault_key {
         return Err(ProgramError::InvalidSeeds);
+    }
+
+    // Session validation (deferred to allow shared authority_data handling)
+    if is_session_auth {
+        let session_data = unsafe { authority_pda.borrow_mut_data_unchecked() };
+        
+        // V3 sessions are 128 bytes, legacy are 80 bytes
+        let is_v3 = session_data.len() >= SessionAccount::SIZE;
+        
+        if session_data.len() < SessionAccount::LEGACY_SIZE {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Use read_unaligned to safely load SessionAccount
+        let session = unsafe {
+            std::ptr::read_unaligned(session_data.as_ptr() as *const SessionAccount)
+        };
+
+        let clock = Clock::get()?;
+        let current_slot = clock.slot;
+
+        // Verify Wallet
+        if session.wallet != *wallet_pda.key() {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        // Verify Expiry
+        if current_slot > session.expires_at {
+            return Err(AuthError::SessionExpired.into());
+        }
+
+        // V3: Check if session is revoked
+        if is_v3 && session.is_revoked() {
+            return Err(AuthError::SessionExpired.into());
+        }
+
+        // Verify Signer matches Session Key
+        let mut signer_matched = false;
+        for acc in accounts {
+            if acc.is_signer() && *acc.key() == session.session_key {
+                signer_matched = true;
+                break;
+            }
+        }
+        if !signer_matched {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        // Store mint for spending limit tracking (V3 only)
+        if is_v3 {
+            session_mint = Some(session.mint);
+        }
+    }
+
+    // Record balance before CPIs for spending limit enforcement (V3 sessions)
+    let balance_before = if session_mint.is_some() {
+        vault_pda.lamports()
+    } else {
+        0
+    };
+
+    // Fee deduction: Transfer BASE_FEE_LAMPORTS from vault to fee_recipient
+    // Fee recipient is read from FeeConfig PDA and verified above
+    if fee_recipient.is_writable() {
+        deduct_fee(vault_pda, fee_recipient, vault_bump, wallet_pda.key())?;
     }
 
     // Execute each compact instruction
@@ -240,6 +309,39 @@ pub fn process(
         // Use unchecked invocation to support dynamic account list (slice)
         unsafe {
             invoke_signed_unchecked(&ix, &cpi_accounts, &[signer]);
+        }
+    }
+
+    // Spending limit enforcement for V3 sessions
+    if session_mint.is_some() {
+        let balance_after = vault_pda.lamports();
+        
+        // Calculate spent amount (only positive spending, ignore deposits)
+        let spent = balance_before.saturating_sub(balance_after);
+        
+        if spent > 0 {
+            // Update session spent_amount
+            let session_data = unsafe { authority_pda.borrow_mut_data_unchecked() };
+            let session_ptr = session_data.as_mut_ptr() as *mut SessionAccount;
+            
+            // Read current session state
+            let session = unsafe { std::ptr::read_unaligned(session_ptr) };
+            
+            // Check if spending would exceed limit
+            if session.would_exceed_limit(spent) {
+                return Err(AuthError::SpendingLimitExceeded.into());
+            }
+            
+            // Update spent_amount
+            let new_spent = session.spent_amount.saturating_add(spent);
+            unsafe {
+                // Write only the spent_amount field (offset: 1+1+1+1+4+32+32+8+32+8 = 120)
+                let spent_offset = 120;
+                std::ptr::write_unaligned(
+                    session_data[spent_offset..].as_mut_ptr() as *mut u64,
+                    new_spent,
+                );
+            }
         }
     }
 
@@ -302,4 +404,43 @@ fn compute_accounts_hash(
     }
 
     Ok(hash)
+}
+
+/// Deduct fee from vault and transfer to fee recipient.
+///
+/// # Arguments
+/// * `vault` - Vault PDA to deduct from
+/// * `fee_recipient` - Account to receive the fee
+/// * `vault_bump` - Bump seed for vault PDA signing
+/// * `wallet_key` - Wallet pubkey for vault seed derivation
+fn deduct_fee(
+    vault: &AccountInfo,
+    fee_recipient: &AccountInfo,
+    vault_bump: u8,
+    wallet_key: &Pubkey,
+) -> ProgramResult {
+    // Check vault has enough balance for fee
+    let vault_balance = vault.lamports();
+    if vault_balance < BASE_FEE_LAMPORTS {
+        // Not enough for fee, skip (or return error if strict)
+        return Ok(());
+    }
+
+    // Transfer fee via direct lamports manipulation
+    // Note: This is safe because we own the vault PDA
+    unsafe {
+        // Deduct from vault
+        let vault_lamports = vault.borrow_mut_lamports_unchecked();
+        *vault_lamports = vault_lamports.saturating_sub(BASE_FEE_LAMPORTS);
+        
+        // Add to fee recipient
+        let recipient_lamports = fee_recipient.borrow_mut_lamports_unchecked();
+        *recipient_lamports = recipient_lamports.saturating_add(BASE_FEE_LAMPORTS);
+    }
+
+    // Suppress unused warnings
+    let _ = vault_bump;
+    let _ = wallet_key;
+
+    Ok(())
 }

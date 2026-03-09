@@ -1,4 +1,5 @@
 pub mod authority;
+pub mod fee;
 pub mod session;
 pub mod wallet;
 
